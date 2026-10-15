@@ -1,52 +1,74 @@
 import {encryptState,decryptState} from './crypto.mjs';
 const account='plusoneapp_appcreater';
-export function choose(state,now=new Date()){
- if(state.version!==1||state.account!==account||state.enabled!==true)return null;
- const local=new Date(now.getTime()+9*3600000),day=(local.getUTCDay()+6)%7;
+function inspect(state,now){
+ if(state.version!==1||state.account!==account)return {result:'blocked',reason:'配信先と保存形式を確認してください。'};
+ if(state.enabled!==true)return {result:'stopped',reason:'クラウドの自動投稿は停止中です。'};
+ const rules=(state.rules??[]).filter(r=>r.enabled&&r.platform==='Threads');
+ if(!rules.length)return {result:'stopped',reason:'Threadsの配信が開始されていません。'};
+ const pending=(state.items??[]).filter(p=>p.platform==='Threads'&&['waiting','sending','error'].includes(p.state));
+ const candidates=[];let blocked='',waiting='',invalid;
  const minute=now.getTime()-now.getTime()%60000;
- for(const rule of state.rules??[]){
-  if(!rule.enabled||rule.platform!=='Threads')continue;
-  const head=(state.items??[]).filter(p=>p.app_id===rule.app_id&&p.platform==='Threads'&&['waiting','sending','error'].includes(p.state)).sort((a,b)=>a.position-b.position)[0];
-  if(!head||head.state!=='waiting')continue;
-  if(!Number.isFinite(Date.parse(head.enqueued_at))||!Number.isFinite(Date.parse(rule.updated_at))){head.state='error';head.message='投稿待ちと配信設定の日時を確認してください。';return {invalid:true,item:head};}
-  for(let offset=0;offset<30;offset++){
+ for(const rule of rules){
+  const head=pending.filter(p=>p.app_id===rule.app_id).sort((a,b)=>a.position-b.position)[0];
+  if(!head)continue;
+  if(head.state!=='waiting'){blocked='先頭の投稿の送信結果を確認してください。後ろの投稿も停止しています。';continue;}
+  if(!Number.isFinite(Date.parse(head.enqueued_at))||!Number.isFinite(Date.parse(rule.updated_at))||!Array.isArray(rule.days)||!Array.isArray(rule.times)){
+   invalid??={invalid:true,item:head,reason:'投稿待ちと配信設定の日時を確認してください。'};continue;
+  }
+  const previous=(state.items??[]).filter(p=>p.app_id===rule.app_id&&p.platform==='Threads'&&p.state==='sent').reduce((latest,p)=>Math.max(latest,Date.parse(p.published_at)||0),0);
+  if(previous&&now.getTime()-previous<30*60000){waiting='前の投稿から30分間は、続けて投稿せず待ちます。';continue;}
+  // GitHub schedules can arrive hours late. Consume the oldest unused slot
+  // within 24 hours, only after both approval and the current rule were saved.
+  for(let offset=1440;offset>=0;offset--){
    const tick=minute-offset*60000,jst=new Date(tick+9*3600000),at=jst.toISOString().slice(0,16),weekday=(jst.getUTCDay()+6)%7;
+   if(tick<now.getTime()-24*3600000)continue;
    if(!rule.days.includes(weekday)||!rule.times.includes(at.slice(11)))continue;
-   if(tick<Date.parse(head.enqueued_at)||tick<Date.parse(rule.updated_at))break;
+   if(tick<Date.parse(head.enqueued_at)||tick<Date.parse(rule.updated_at))continue;
    const key=`${rule.app_id}|Threads|${at}`;
-   if(state.ticks?.[key])break;
-   const text=[head.body.trim(),head.hashtags.trim()].filter(Boolean).join('\n\n');
-   if(!text||[...text].length>500||text.includes('［')||text.includes('］')||text.includes('[要確認]')){head.state='error';head.message='投稿文を確認してください。';return {invalid:true,item:head};}
-   return {item:head,at,key,text};
+   if(Object.hasOwn(state.ticks??{},key))continue;
+   const text=[head.body,head.hashtags].map(s=>typeof s==='string'?s.trim():'').filter(Boolean).join('\n\n');
+   if(typeof head.body!=='string'||!head.body.trim()||!text||[...text].length>500||text.includes('［')||text.includes('］')||text.includes('[要確認]')){invalid??={invalid:true,item:head,reason:'投稿文を確認してください。'};break;}
+   candidates.push({item:head,at,key,text,tick});break;
   }
  }
- return null;
+ if(candidates.length)return {selected:candidates.sort((a,b)=>a.tick-b.tick||a.item.position-b.item.position)[0]};
+ if(invalid)return {selected:invalid};
+ if(blocked)return {result:'blocked',reason:blocked};
+ if(waiting)return {result:'waiting',reason:waiting};
+ if(pending.some(p=>!rules.some(r=>r.app_id===p.app_id))){
+  const configuredWaiting=pending.some(p=>p.state==='waiting'&&rules.some(r=>r.app_id===p.app_id));
+  return configuredWaiting?{result:'waiting',reason:'一部の投稿待ちに配信設定がありません。設定済みの対象は次の時刻を待っています。'}:{result:'blocked',reason:'投稿待ちの発信対象に、配信中の設定がありません。'};
+ }
+ return {result:'waiting',reason:pending.length?'未使用の投稿時刻を待っています。24時間より前の時刻には遡りません。':'配信対象の投稿待ちがありません。'};
 }
+export function choose(state,now=new Date()){return inspect(state,now).selected??null;}
+function health(state,now,result,reason){state.last_run_at=now.toISOString();state.last_result=result;state.last_reason=reason;}
 export async function run(store,publisher,{now=new Date(),dryRun=true}={}){
  const saved=await store.read(),state=saved.state;
+ if(dryRun){await publisher.identity(account);const selected=choose(state,now);return {dry_run:true,eligible:!!selected&&!selected.invalid,account_verified:true};}
  // A previously durable sending marker can be an interrupted successful POST.
  // Never automatically re-send it, and keep its queue blocked.
- let recovered=false;
- for(const item of state.items??[])if(item.state==='sending'){item.state='error';item.message='前回の送信結果が未確定です。自動では再送しません。';recovered=true;}
- const selected=choose(state,now);
- if(dryRun){await publisher.identity(account);return {dry_run:true,eligible:!!selected,account_verified:true};}
- if(!selected){if(recovered)await store.write(state,saved.sha);return {sent:0};}
- if(selected.invalid){await store.write(state,saved.sha);return {sent:0};}
- try{await publisher.identity(account);}catch{state.message='Threadsの接続を確認してください。投稿待ちは送信していません。';await store.write(state,saved.sha);return {sent:0,connection_error:true};}
+ for(const item of state.items??[])if(item.state==='sending'){item.state='error';item.message='前回の送信結果が未確定です。自動では再送しません。';}
+ const decision=inspect(state,now),selected=decision.selected;
+ if(!selected){health(state,now,decision.result,decision.reason);await store.write(state,saved.sha);return {sent:0,result:decision.result,reason:decision.reason};}
+ if(selected.invalid){selected.item.state='error';selected.item.message=selected.reason;health(state,now,'blocked',selected.reason);await store.write(state,saved.sha);return {sent:0,result:'blocked',reason:selected.reason};}
+ try{await publisher.identity(account);}catch{state.message='Threadsの接続を確認してください。投稿待ちは送信していません。';health(state,now,'connection_error',state.message);await store.write(state,saved.sha);return {sent:0,result:'connection_error',reason:state.message,connection_error:true};}
  state.message='';
  state.ticks??={};state.ticks[selected.key]=selected.item.id;
  selected.item.state='sending';selected.item.dispatch_at=selected.at;state.updated_at=now.toISOString();
+ health(state,now,'blocked','投稿を送信中です。結果が確定するまで再送しません。');
  const sha=await store.write(state,saved.sha); // MUST be durable before any SNS POST.
  let result;
  try{result=await publisher.publish(selected.text);}catch{
   selected.item.state='error';selected.item.message='送信結果を確認できません。SNSで確認するまで再送しません。';
-  await store.write(state,sha);return {sent:0,uncertain:true};
+  health(state,now,'blocked',selected.item.message);await store.write(state,sha);return {sent:0,result:'blocked',reason:selected.item.message,uncertain:true};
  }
  selected.item.state='sent';selected.item.media_id=result.id;selected.item.url=result.url??'';selected.item.published_at=now.toISOString();selected.item.message='';
  // Keep idempotency receipts permanently; the original post remains in the PC database.
  selected.item.body='';selected.item.hashtags='';
+ state.last_published_at=now.toISOString();health(state,now,'sent','確認済みの投稿を1件公開しました。');
  await store.write(state,sha); // Failure leaves the remote pre-POST sending marker intact.
- return {sent:1};
+ return {sent:1,result:'sent',reason:state.last_reason};
 }
 export function githubStore({repo,token,key,fetcher=fetch}){
  const endpoint=`https://api.github.com/repos/${repo}/contents/cloud-state.json`;

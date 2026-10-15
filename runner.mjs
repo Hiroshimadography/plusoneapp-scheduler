@@ -1,6 +1,6 @@
 import {run,githubStore} from './scheduler.mjs';
 const {GITHUB_REPOSITORY:repo,GITHUB_TOKEN:token,SCHEDULER_KEY:key,THREADS_TOKEN:threads}=process.env;
-if(!repo||!token||!key||!threads){console.error('Scheduler credentials are missing.');process.exit(1);}
+if(!repo||!token||!key||!threads){console.error(JSON.stringify({sent:0,result:'connection_error',reason:'クラウド配信の接続情報が不足しています。'}));process.exit(1);}
 let liveToken=threads;
 const publisher={
  async identity(expected){
@@ -23,4 +23,8 @@ try{
   try{const response=await fetch(endpoint,{signal:AbortSignal.timeout(15000)});if(response.ok){const value=await response.json();if(typeof value.access_token==='string'&&value.access_token){saved.state.threads_token=value.access_token;saved.state.token_refreshed_at=new Date().toISOString();await store.write(saved.state,saved.sha);liveToken=value.access_token;}}}catch{}
  }
  const result=await run(store,publisher,{dryRun});console.log(JSON.stringify(result));
-}catch{console.error('Scheduler stopped. Check the account connection or encrypted queue sync. No automatic retry of an uncertain publication.');process.exit(1);}
+}catch{
+ // Storage/authentication failures may prevent persisting health itself. Keep
+ // this diagnostic public-safe, and never print request objects or credentials.
+ console.error(JSON.stringify({sent:0,result:'blocked',reason:'クラウドの記録や接続を確認できず停止しました。送信結果が未確定の投稿は自動で再送しません。'}));process.exit(1);
+}
