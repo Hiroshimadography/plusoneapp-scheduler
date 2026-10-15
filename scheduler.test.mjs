@@ -79,3 +79,59 @@ test('dry-run does not report invalid copy as eligible and does not mutate produ
  const result=await run(store,p,{now,dryRun:true});assert.equal(result.eligible,false);assert.equal(result.account_verified,true);
  assert.deepEqual(store.state,value);assert.equal(store.writes,0);assert.equal(p.calls,0);
 });
+function commented(){const value=fixture();value.items=value.items.slice(0,1);value.items[0].first_comment='詳しい使い方の補足です。';return value;}
+function replyPublisher(store){const p=publisher();p.replies=[];p.reply=async(text,parent)=>{
+ const receipt=store.state.items[0];assert.equal(receipt.state,'sent');assert.equal(receipt.media_id,'123');assert.equal(receipt.comment_state,'sending');assert.equal(receipt.comment_parent_id,parent);
+ p.replies.push({text,parent});return {id:'456'};
+};return p;}
+test('account schedule picks one FIFO across app subjects and applies cooldown across them',async()=>{
+ const value=fixture();value.rules[0].scope='account';value.rules[0].times=['08:00','12:00'];value.items[0].app_id='okaimo';value.items[1].app_id='manaloop';value.items.reverse();
+ const store=memory(value),p=publisher(),at=new Date('2026-10-07T06:00:00Z');await run(store,p,{now:at,dryRun:false});
+ assert.equal(store.state.items.find(i=>i.id==='one').state,'sent');assert.equal(store.state.items.find(i=>i.id==='two').state,'waiting');assert.equal(store.state.ticks['|Threads|2026-10-07T08:00'],'one');
+ await run(store,p,{now:new Date(at.getTime()+5*60000),dryRun:false});assert.equal(p.calls,1);
+ await run(store,p,{now:new Date(at.getTime()+30*60000),dryRun:false});assert.equal(p.calls,2);
+});
+test('a paused account rule cannot fall back to an old enabled per-app rule',async()=>{
+ const value=fixture();value.items[0].app_id='okaimo';value.rules.push({...value.rules[0],app_id:'okaimo'});value.rules[0]={...value.rules[0],scope:'account',enabled:false};
+ const store=memory(value),p=publisher();await run(store,p,{now,dryRun:false});assert.equal(p.calls,0);assert.equal(store.state.last_result,'stopped');
+});
+test('body receipt is durable before comment claim, reply uses that exact parent and logs contain no copy',async()=>{
+ const store=memory(commented()),p=replyPublisher(store),result=await run(store,p,{now,dryRun:false});
+ assert.equal(result.sent,1);assert.equal(result.comment_sent,1);assert.deepEqual(p.replies,[{text:'詳しい使い方の補足です。',parent:'123'}]);
+ assert.equal(store.state.items[0].comment_state,'sent');assert.equal(store.state.items[0].comment_media_id,'456');assert.equal(store.state.items[0].first_comment,'');
+ assert(!JSON.stringify(result).includes('補足'));assert(!JSON.stringify(result).includes('https://'));await run(store,p,{now,dryRun:false});assert.equal(p.calls,1);assert.equal(p.replies.length,1);
+});
+test('comment timeout leaves body sent and never automatically re-sends either publication',async()=>{
+ const store=memory(commented()),p=replyPublisher(store);let calls=0;p.reply=async()=>{calls++;throw Error('timeout')};
+ const result=await run(store,p,{now,dryRun:false});assert.equal(result.sent,1);assert.equal(result.result,'comment_error');assert.equal(store.state.items[0].state,'sent');assert.equal(store.state.items[0].comment_state,'uncertain');
+ await run(store,p,{now:new Date('2026-10-14T03:02:00Z'),dryRun:false});assert.equal(p.calls,1);assert.equal(calls,1);assert.equal(store.state.last_result,'comment_error');
+});
+test('body result persistence failure never starts a comment and never re-sends the body',async()=>{
+ const store=memory(commented()),p=replyPublisher(store),write=store.write.bind(store);store.write=async(v,sha)=>{if(v.items[0].state==='sent')throw Error('body result lost');return write(v,sha)};
+ await assert.rejects(run(store,p,{now,dryRun:false}));assert.equal(store.state.items[0].state,'sending');assert.equal(p.replies.length,0);
+ store.write=write;await run(store,p,{now,dryRun:false});assert.equal(p.calls,1);assert.equal(p.replies.length,0);assert.equal(store.state.items[0].state,'error');
+});
+test('a comment whose pre-POST claim was not saved can safely resume without re-sending body',async()=>{
+ const store=memory(commented()),p=replyPublisher(store),write=store.write.bind(store);store.write=async(v,sha)=>{if(v.items[0].comment_state==='sending')throw Error('comment claim CAS conflict');return write(v,sha)};
+ await assert.rejects(run(store,p,{now,dryRun:false}));assert.equal(store.state.items[0].state,'sent');assert.equal(store.state.items[0].comment_state,'waiting');assert.equal(p.replies.length,0);
+ store.write=write;const resumed=await run(store,p,{now:new Date(now.getTime()+60000),dryRun:false});assert.equal(resumed.sent,0);assert.equal(resumed.comment_sent,1);assert.equal(p.calls,1);assert.equal(p.replies.length,1);
+});
+test('a lost comment success record becomes uncertain and cannot trigger a duplicate reply',async()=>{
+ const store=memory(commented()),p=replyPublisher(store),write=store.write.bind(store);store.write=async(v,sha)=>{if(v.items[0].comment_state==='sent')throw Error('reply result lost');return write(v,sha)};
+ await assert.rejects(run(store,p,{now,dryRun:false}));assert.equal(store.state.items[0].state,'sent');assert.equal(store.state.items[0].comment_state,'sending');
+ store.write=write;await run(store,p,{now,dryRun:false});assert.equal(store.state.items[0].comment_state,'uncertain');assert.equal(store.state.last_result,'comment_error');assert.equal(p.calls,1);assert.equal(p.replies.length,1);
+});
+test('waiting comments obey stop, validate their fixed parent and preserve read-only dry-run',async()=>{
+ const value=commented();Object.assign(value.items[0],{state:'sent',media_id:'123',comment_parent_id:'123',comment_state:'waiting',published_at:now.toISOString()});
+ const store=memory(value),p=replyPublisher(store);await run(store,p,{now,dryRun:true});assert.deepEqual(store.state,value);assert.equal(store.writes,0);assert.equal(p.replies.length,0);
+ const paused=structuredClone(value);paused.enabled=false;const stop=memory(paused);await run(stop,p,{now,dryRun:false});assert.equal(stop.state.items[0].comment_state,'waiting');assert.equal(p.replies.length,0);
+ value.items[0].comment_parent_id='999';const bad=memory(value);await run(bad,p,{now,dryRun:false});assert.equal(bad.state.items[0].state,'sent');assert.equal(bad.state.items[0].comment_state,'error');assert.equal(p.calls,0);assert.equal(p.replies.length,0);
+});
+test('an invalid comment prevents body publication rather than knowingly creating a partial post',async()=>{
+ const value=commented();value.items[0].first_comment='a'.repeat(501);const store=memory(value),p=replyPublisher(store);
+ await run(store,p,{now,dryRun:false});assert.equal(store.state.items[0].state,'error');assert.equal(p.calls,0);assert.equal(p.replies.length,0);
+});
+test('concurrent recovery runs CAS-claim a waiting comment once',async()=>{
+ const value=commented();Object.assign(value.items[0],{state:'sent',media_id:'123',comment_parent_id:'123',comment_state:'waiting',published_at:now.toISOString()});const store=memory(value),p=replyPublisher(store);
+ const results=await Promise.allSettled([run(store,p,{now,dryRun:false}),run(store,p,{now,dryRun:false})]);assert.equal(results.filter(r=>r.status==='fulfilled').length,1);assert.equal(p.calls,0);assert.equal(p.replies.length,1);
+});

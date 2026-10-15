@@ -7,8 +7,11 @@ const publisher={
   const response=await fetch('https://graph.threads.net/me?fields=id,username',{headers:{Authorization:`Bearer ${liveToken}`},signal:AbortSignal.timeout(15000)});
   if(!response.ok||(await response.json()).username!==expected)throw Error('Account connection needs attention');
  },
- async publish(text){
-  const response=await fetch('https://graph.threads.net/me/threads',{method:'POST',headers:{Authorization:`Bearer ${liveToken}`},body:new URLSearchParams({media_type:'TEXT',text,auto_publish_text:'true'}),signal:AbortSignal.timeout(30000)});
+ async reply(text,parent){return this.publish(text,parent);},
+ async publish(text,parent){
+  const fields={media_type:'TEXT',text,auto_publish_text:'true'};
+  if(parent!==undefined){if(!/^\d+$/.test(parent))throw Error('Invalid parent receipt');fields.reply_to_id=parent;}
+  const response=await fetch('https://graph.threads.net/me/threads',{method:'POST',headers:{Authorization:`Bearer ${liveToken}`},body:new URLSearchParams(fields),signal:AbortSignal.timeout(30000)});
   if(!response.ok)throw Error('Publication result is uncertain');const value=await response.json();if(!/^\d+$/.test(value.id??''))throw Error('Missing publication result');
   let url='';try{const result=await fetch(`https://graph.threads.net/${value.id}?fields=permalink`,{headers:{Authorization:`Bearer ${liveToken}`},signal:AbortSignal.timeout(15000)});if(result.ok){const link=(await result.json()).permalink;if(typeof link==='string'&&link.startsWith('https://'))url=link;}}catch{}
   return {id:value.id,url};
